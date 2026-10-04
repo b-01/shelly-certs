@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# shelly-deploy-hook: lego runs this after it issued or renewed a certificate (--deploy-hook).
+# It deploys the certificate to the matching Shelly device.
+#
+# lego v5 passes LEGO_HOOK_CERT_PATH, LEGO_HOOK_CERT_KEY_PATH, LEGO_HOOK_CERT_NAME and
+# LEGO_HOOK_CERT_DOMAINS. shelly-certs also passes SHELLY_CERTS_DEVICE. Without it, the device is
+# the one whose first domain is the certificate name, so the hook also works with a hand-run lego.
+#
+# The result goes to data/status/<device>.hook ("ok <fingerprint>" or "failed <fingerprint>") so
+# shelly-certs can tell a failed deploy from a failed ACME request: lego exits non-zero for both.
+set -euo pipefail
+# Never trace this script: it handles device passwords.
+set +o xtrace
+umask 077
+
+SC_ROOT=$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")")
+# shellcheck source=../lib/common.sh
+source "$SC_ROOT/lib/common.sh"
+
+# Start over with only the allowed environment variables, so DNS credentials from lego's
+# environment never reach this script or curl.
+if [[ ${SHELLY_CERTS_HOOK_CLEAN_ENV:-} != 1 ]]; then
+	keep=()
+	for name in $(hook_env_keep_names); do
+		keep+=("$name=${!name}")
+	done
+	exec env -i "${keep[@]}" SHELLY_CERTS_HOOK_CLEAN_ENV=1 "$SC_ROOT/bin/shelly-deploy-hook" "$@"
+fi
+
+# shellcheck source=../lib/config.sh
+source "$SC_ROOT/lib/config.sh"
+# shellcheck source=../lib/certs.sh
+source "$SC_ROOT/lib/certs.sh"
+# shellcheck source=../lib/shelly.sh
+source "$SC_ROOT/lib/shelly.sh"
+
+if [[ -z ${LEGO_HOOK_CERT_PATH:-} || -z ${LEGO_HOOK_CERT_KEY_PATH:-} ]]; then
+	die "LEGO_HOOK_CERT_PATH and LEGO_HOOK_CERT_KEY_PATH must be set; lego sets them when it calls this hook"
+fi
+load_global_config || die "config has errors, run 'shelly-certs validate'"
+
+device=${SHELLY_CERTS_DEVICE:-}
+if [[ -z $device ]]; then
+	cert_domains=${LEGO_HOOK_CERT_DOMAINS:-}
+	domain=${LEGO_HOOK_CERT_NAME:-${cert_domains%%,*}}
+	device=$(find_device_by_domain "$domain") || die "no device config has $domain as first domain"
+fi
+LOG_PREFIX=$device
+load_device "$device" || die "device config has errors, run 'shelly-certs validate'"
+
+make_workdir
+mkdir -p "$SC_STATUS_DIR"
+fp=$(cert_fingerprint "$LEGO_HOOK_CERT_PATH" 2>/dev/null) || fp=unknown
+log "lego has a new certificate $fp, deploying"
+if deploy_device "$LEGO_HOOK_CERT_PATH" "$LEGO_HOOK_CERT_KEY_PATH"; then
+	printf 'ok %s\n' "$fp" >"$SC_STATUS_DIR/$device.hook"
+else
+	printf 'failed %s\n' "$fp" >"$SC_STATUS_DIR/$device.hook"
+	exit 1
+fi

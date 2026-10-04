@@ -1,0 +1,51 @@
+# Global settings for shelly-certs. Copy to shelly-certs.conf and adjust.
+# Format: KEY=VALUE, one per line. Lines starting with # are comments.
+# Relative paths are relative to the tool folder.
+
+# Contact address for the Let's Encrypt account.
+ACME_EMAIL=admin@example.com
+
+# Start with staging. Switch to https://acme-v02.api.letsencrypt.org/directory after testing.
+# lego keeps a separate account per ACME server, so switching creates a new account automatically.
+ACME_SERVER=https://acme-staging-v02.api.letsencrypt.org/directory
+
+# lego DNS provider code. List all with `lego dnshelp`, details with `lego dnshelp -c hetzner`.
+DNS_PROVIDER=hetzner
+
+# dotenv file with the provider's credentials, handed to lego with --env-file.
+# See config/dns.env.example.
+DNS_ENV_FILE=secrets/dns.env
+
+# Resolvers lego uses to find the zone of your domains and the zone's nameservers. lego then asks
+# those nameservers directly whether the TXT record is there. Needed with split DNS, where your
+# local resolver answers for the zone itself.
+DNS_RESOLVERS=1.1.1.1:53,9.9.9.9:53
+
+# One of: ec256 ec384 rsa2048 rsa3072 rsa4096. Shelly recommends EC P-256.
+KEY_TYPE=ec256
+
+# Renew when fewer than this many days are left. lego also renews earlier if Let's Encrypt
+# asks for it through its renewal info service (ARI).
+RENEW_DAYS=30
+
+# Seconds to wait for a device to come back with the new certificate after a reboot.
+REBOOT_TIMEOUT=120
+
+# User for HTTP digest auth when a device file doesn't set SHELLY_USER. Shelly Gen2+ always uses admin.
+DEFAULT_SHELLY_USER=admin
+
+# yes = when neither verified HTTPS nor plain HTTP works, deploy over HTTPS without checking the
+# device's certificate (curl -k). shelly-certs first tries HTTPS and checks that the device's
+# certificate is valid for the first name in DOMAINS. If that fails, it uses plain HTTP. This
+# setting only matters when that fails too because the device redirects HTTP to HTTPS, for example
+# when it still serves an expired certificate or a staging one after you switched to production.
+# With no, the deploy stops with an error. With yes, nothing checks who answers at ADDRESS, so
+# another machine on your network posing as the device would receive the new private key. Turn it
+# on for a single `shelly-certs deploy NAME`, then set it back to no.
+ALLOW_INSECURE_DEPLOY=no
+
+# CA certificates (PEM) to trust instead of the system trust store when checking a device's HTTPS
+# certificate. Leave empty for production. Needed with staging, whose root CA the system doesn't trust:
+# https://letsencrypt.org/certs/staging/letsencrypt-stg-root-x1.pem
+# and https://letsencrypt.org/certs/staging/letsencrypt-stg-root-x2.pem
+DEVICE_CA_FILE=

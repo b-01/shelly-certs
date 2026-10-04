@@ -1,0 +1,9 @@
+/CLAUDE.md
+/.claude/
+
+/config/shelly-certs.conf
+/config/devices.d/*.conf
+/secrets/
+/data/
+/systemd/generated/
+/tests/staging.env

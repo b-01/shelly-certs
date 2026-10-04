@@ -1,0 +1,20 @@
+# One Shelly device. Copy to <name>.conf in this folder; <name> becomes the device name.
+# Only files ending in .conf are read. To stop managing a device, delete its file and run
+# `shelly-certs prune --yes`.
+
+# Space-separated. The first one is the certificate name and the name used to reach the device
+# over HTTPS; the others are extra names in the certificate.
+DOMAINS=livingroom.shelly.example.com
+
+# IP address or host name used to reach the device on the local network.
+ADDRESS=192.168.1.50
+
+# Optional. Falls back to DEFAULT_SHELLY_USER from shelly-certs.conf.
+#SHELLY_USER=admin
+
+# Optional. File with the device password on its first line. Leave out if the device has no password.
+#SHELLY_PASSWORD_FILE=secrets/livingroom.password
+
+# auto = reboot the device after the upload and check it serves the new certificate.
+# manual = only upload; the device uses the new certificate after you reboot it yourself.
+REBOOT=auto

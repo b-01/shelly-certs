@@ -1,0 +1,438 @@
+#!/usr/bin/env bash
+# shelly-certs: issues and renews Let's Encrypt certificates for Shelly devices with lego and
+# deploys them to the devices. Run `shelly-certs help` for the commands.
+#
+# The systemd timer runs `shelly-certs run` as the shelly-certs user. `run` calls lego once per
+# device, and lego calls bin/shelly-deploy-hook whenever it saved a new certificate. Everything the
+# tool writes goes to data/: lego's certificates and accounts, the lock file and status files.
+set -euo pipefail
+# Never trace this script: some commands handle device passwords.
+set +o xtrace
+# Files this script and lego create (keys, status files) are readable only by their owner.
+umask 077
+
+SC_ROOT=$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")")
+# shellcheck source=../lib/common.sh
+source "$SC_ROOT/lib/common.sh"
+# shellcheck source=../lib/config.sh
+source "$SC_ROOT/lib/config.sh"
+# shellcheck source=../lib/certs.sh
+source "$SC_ROOT/lib/certs.sh"
+# shellcheck source=../lib/shelly.sh
+source "$SC_ROOT/lib/shelly.sh"
+# shellcheck source=../lib/lego.sh
+source "$SC_ROOT/lib/lego.sh"
+
+usage() {
+	cat <<EOF
+Usage: shelly-certs COMMAND [OPTIONS]
+
+Commands:
+  run [--device NAME]... [--dry-run] [--force]
+                   Issue or renew certificates and deploy them where needed (the timer runs this).
+  deploy NAME      Push the current local certificate to one device. No ACME contact.
+  status           Show local certificate expiry and whether each device serves it.
+  list             Print the configured device names.
+  validate         Check config and secrets without network access.
+  prune [--yes]    List certificates no device uses; with --yes delete them.
+  help             Show this help.
+
+Tool folder: $SC_ROOT
+EOF
+}
+
+usage_error() {
+	err "$@"
+	usage >&2
+	exit 2
+}
+
+cmd_list() {
+	device_names
+}
+
+# Checks that every *_FILE entry in the DNS env file points to an existing file. lego runs with
+# the tool folder as working directory, so relative paths are relative to it. Only *_FILE lines
+# are read, and they hold paths, so no token ends up in the output.
+check_dns_env_file_refs() {
+	local env_file=$1 line key value rc=0
+	while IFS= read -r line || [[ -n $line ]]; do
+		[[ $line =~ ^[[:space:]]*(export[[:space:]]+)?([A-Za-z0-9_]+_FILE)[[:space:]]*=[[:space:]]*(.*)$ ]] || continue
+		key=${BASH_REMATCH[2]}
+		value=${BASH_REMATCH[3]}
+		value=${value%\"}
+		value=${value#\"}
+		value=${value%\'}
+		value=${value#\'}
+		value=$(abs_path "$value")
+		if [[ ! -f $value ]]; then
+			err "$env_file: $key: file $value does not exist"
+			rc=1
+		else
+			check_secret_mode "$value"
+		fi
+	done <"$env_file"
+	return $rc
+}
+
+cmd_validate() {
+	local rc=0 name count=0
+	load_global_config || rc=1
+	if [[ -n ${CFG[DNS_ENV_FILE]:-} && -f ${CFG[DNS_ENV_FILE]} ]]; then
+		check_secret_mode "${CFG[DNS_ENV_FILE]}"
+		check_dns_env_file_refs "${CFG[DNS_ENV_FILE]}" || rc=1
+	fi
+	validate_devices || rc=1
+	while IFS= read -r name; do
+		count=$((count + 1))
+		if load_device "$name" 2>/dev/null && [[ -n ${DEV[SHELLY_PASSWORD_FILE]} ]]; then
+			check_secret_mode "${DEV[SHELLY_PASSWORD_FILE]}"
+		fi
+	done < <(device_names)
+	if [[ $rc -ne 0 ]]; then
+		err "config has errors"
+		return 1
+	fi
+	log "config OK: $count device(s)"
+}
+
+cmd_deploy() {
+	if [[ $# -ne 1 ]]; then
+		err "deploy needs exactly one device name"
+		usage >&2
+		exit 2
+	fi
+	local name=$1 cert key
+	acquire_lock
+	load_global_config || die "config has errors, run 'shelly-certs validate'"
+	load_device "$name" || die "device config has errors, run 'shelly-certs validate'"
+	LOG_PREFIX=$name
+	cert=$(cert_path "${DEV[FIRST_DOMAIN]}")
+	key=$(key_path "${DEV[FIRST_DOMAIN]}")
+	[[ -f $cert ]] || die "no local certificate $cert, run 'shelly-certs run --device $name' first"
+	make_workdir
+	if ! deploy_device "$cert" "$key"; then
+		exit 1
+	fi
+}
+
+# Prints what the device serves compared with the local certificate: yes, no, pending-reboot
+# (uploaded to a REBOOT=manual device that hasn't rebooted yet) or unreachable (no TLS answer).
+# The pending marker is checked even without a TLS answer: a device that never had HTTPS only
+# starts serving it after the reboot.
+device_cert_state() {
+	local cert=$1 local_fp="" served="" marker
+	served=$(served_fingerprint "${DEV[ADDRESS]}" "${DEV[FIRST_DOMAIN]}" 2>/dev/null) || served=""
+	[[ -f $cert ]] && local_fp=$(cert_fingerprint "$cert")
+	if [[ -n $local_fp && $served == "$local_fp" ]]; then
+		echo yes
+		return
+	fi
+	marker=$(pending_marker)
+	if [[ -n $local_fp && -f $marker && $(<"$marker") == "$local_fp" ]]; then
+		echo pending-reboot
+		return
+	fi
+	if [[ -z $served ]]; then
+		echo unreachable
+		return
+	fi
+	echo no
+}
+
+cmd_status() {
+	local name cert expiry days state
+	load_global_config || die "config has errors, run 'shelly-certs validate'"
+	{
+		printf 'DEVICE\tDOMAIN\tEXPIRES\tDAYS_LEFT\tDEVICE_CERT\n'
+		while IFS= read -r name; do
+			if ! load_device "$name" 2>/dev/null; then
+				printf '%s\t-\t-\t-\tconfig-error\n' "$name"
+				continue
+			fi
+			cert=$(cert_path "${DEV[FIRST_DOMAIN]}")
+			expiry=- days=-
+			if [[ -f $cert ]]; then
+				expiry=$(cert_expiry_date "$cert")
+				days=$(cert_days_left "$cert")
+			fi
+			state=$(device_cert_state "$cert")
+			printf '%s\t%s\t%s\t%s\t%s\n' "$name" "${DEV[FIRST_DOMAIN]}" "$expiry" "$days" "$state"
+		done < <(device_names)
+	} | column -t -s $'\t'
+}
+
+# Lines from lego get "<device>: lego: " in front. lego passes on the deploy hook's lines, which
+# already start with "<device>: "; those stay as they are.
+prefix_lego_output() {
+	local line
+	while IFS= read -r line || [[ -n $line ]]; do
+		if [[ $line == "$LOG_PREFIX: "* ]]; then
+			printf '%s\n' "$line"
+		else
+			printf '%s: lego: %s\n' "$LOG_PREFIX" "$line"
+		fi
+	done
+}
+
+# Writes the current device's one-line result for the summary at the end of `run`.
+outcome() { printf '%s\n' "$*" >"$OUTCOME_FILE"; }
+
+# Drift check: deploys CERT and KEY when the device doesn't serve CERT. This covers new devices,
+# factory resets and earlier failed deploys. Sets DRIFT_RESULT for the summary and fails when the
+# deploy fails.
+check_device_cert() {
+	local cert=$1 key=$2
+	case $(device_cert_state "$cert") in
+	yes)
+		log "the device serves the local certificate"
+		DRIFT_RESULT="up to date"
+		return 0
+		;;
+	pending-reboot)
+		log "the certificate is uploaded and waits for you to reboot the device"
+		DRIFT_RESULT="reboot pending"
+		return 0
+		;;
+	unreachable) log "no HTTPS answer from the device, deploying the local certificate" ;;
+	*) log "the device serves another certificate, deploying the local certificate" ;;
+	esac
+	if ! deploy_device "$cert" "$key"; then
+		DRIFT_RESULT="deploy failed"
+		return 1
+	fi
+	if [[ $DRY_RUN == 1 ]]; then
+		DRIFT_RESULT="dry run: would deploy"
+	elif [[ ${DEV[REBOOT]} == manual ]]; then
+		DRIFT_RESULT="deployed, reboot pending"
+	else
+		DRIFT_RESULT="deployed"
+	fi
+}
+
+# run_device NAME does `run` for one device: lego, then the drift check. cmd_run calls it in a
+# subshell, so `die` or an unexpected error only ends this device. The result goes to OUTCOME_FILE.
+#
+# lego exits non-zero both when getting the certificate from Let's Encrypt fails and when the
+# deploy hook fails. The certificate's fingerprint before and after lego, plus the hook's status
+# file, tell the two apart.
+run_device() {
+	local name=$1 cert key before="" after="" status="" rc drift_rc=0 command
+	local -a lego_args
+	LOG_PREFIX=$name
+	if ! load_device "$name"; then
+		outcome "FAILED: config has errors, run 'shelly-certs validate'"
+		return 1
+	fi
+	if ((FIRST_DOMAIN_COUNT[${DEV[FIRST_DOMAIN]}] > 1)); then
+		err "first domain ${DEV[FIRST_DOMAIN]} is also used by another device, run 'shelly-certs validate'"
+		outcome "FAILED: first domain ${DEV[FIRST_DOMAIN]} is also used by another device"
+		return 1
+	fi
+	cert=$(cert_path "${DEV[FIRST_DOMAIN]}")
+	key=$(key_path "${DEV[FIRST_DOMAIN]}")
+	[[ -f $cert ]] && before=$(cert_fingerprint "$cert")
+	lego_run_args lego_args "$RUN_FORCE"
+
+	if [[ $DRY_RUN == 1 ]]; then
+		command=$(printf '%q ' "${lego_args[@]}")
+		log "dry run: would run in $SC_ROOT: SHELLY_CERTS_DEVICE=$name ${command% }"
+		if [[ -z $before ]]; then
+			log "dry run: no local certificate yet, lego would request one and the hook would deploy it"
+			outcome "dry run: would request a certificate"
+			return 0
+		fi
+		log "dry run: lego would renew only if the certificate is due ($(cert_days_left "$cert") days left," \
+			"RENEW_DAYS=${CFG[RENEW_DAYS]}), Let's Encrypt asks for it, or DOMAINS changed; the hook would then deploy it"
+		check_device_cert "$cert" "$key" || drift_rc=1
+		outcome "$DRIFT_RESULT"
+		return $drift_rc
+	fi
+
+	# A status file left from an earlier run must not count for this one.
+	rm -f "$SC_STATUS_DIR/$name.hook"
+	log "running lego"
+	if (cd "$SC_ROOT" && SHELLY_CERTS_DEVICE=$name "${lego_args[@]}") 2>&1 | prefix_lego_output; then
+		rc=0
+	else
+		rc=${PIPESTATUS[0]}
+	fi
+	[[ -f $cert ]] && after=$(cert_fingerprint "$cert")
+
+	if [[ -n $after && $after != "$before" ]]; then
+		[[ -f $SC_STATUS_DIR/$name.hook ]] && status=$(<"$SC_STATUS_DIR/$name.hook")
+		if [[ $status == "ok $after" ]]; then
+			((rc == 0)) || warn "lego exited with code $rc after the deploy hook succeeded"
+			if [[ ${DEV[REBOOT]} == manual ]]; then
+				outcome "new certificate uploaded, reboot pending"
+			else
+				outcome "new certificate deployed"
+			fi
+			return 0
+		fi
+		# A missing status file also ends up here: lego kills the hook when --deploy-hook-timeout
+		# runs out, before the hook can write one.
+		err "lego saved a new certificate, but the deploy hook reports: ${status:-nothing}. The next run deploys it again"
+		outcome "FAILED: new certificate, deploy failed"
+		return 1
+	fi
+
+	if ((rc != 0)); then
+		err "lego failed (exit code $rc)"
+		if [[ -z $after ]]; then
+			outcome "FAILED: lego failed, no local certificate"
+			return 1
+		fi
+		log "checking the device with the existing certificate anyway"
+	fi
+	check_device_cert "$cert" "$key" || drift_rc=1
+	if ((rc != 0)); then
+		outcome "FAILED: lego failed, device: $DRIFT_RESULT"
+		return 1
+	fi
+	if ((drift_rc != 0)); then
+		outcome "FAILED: $DRIFT_RESULT"
+		return 1
+	fi
+	outcome "$DRIFT_RESULT"
+}
+
+cmd_run() {
+	local name rc failed=0 count=0 result
+	local -a selected=() summary=()
+	RUN_FORCE=0
+	while [[ $# -gt 0 ]]; do
+		case $1 in
+		--device)
+			[[ -n ${2:-} ]] || usage_error "--device needs a device name"
+			selected+=("$2")
+			shift 2
+			;;
+		--dry-run)
+			DRY_RUN=1
+			shift
+			;;
+		--force)
+			RUN_FORCE=1
+			shift
+			;;
+		*) usage_error "run: unknown option $1" ;;
+		esac
+	done
+	for name in "${selected[@]}"; do
+		[[ -f $SC_DEVICES_DIR/$name.conf ]] || usage_error "no device config $SC_DEVICES_DIR/$name.conf"
+	done
+
+	acquire_lock
+	load_global_config || die "config has errors, run 'shelly-certs validate'"
+	# lego splits the --deploy-hook value at spaces and runs it without a shell.
+	[[ $SC_ROOT != *[[:space:]]* ]] || die "the tool folder '$SC_ROOT' contains a space, so lego can't call the deploy hook. Move the folder"
+	if [[ $DRY_RUN == 0 ]] && ! command -v lego >/dev/null; then
+		die "lego is not installed or not on PATH"
+	fi
+	if [[ $RUN_FORCE == 1 ]]; then
+		warn "--force renews every selected certificate now. Let's Encrypt allows only 5 certificates for the same set of names per week"
+	fi
+
+	# Two devices with the same first domain would share one certificate, so both fail.
+	# Counted over all devices, also when --device picks only some.
+	declare -gA FIRST_DOMAIN_COUNT=()
+	while IFS= read -r name; do
+		load_device "$name" 2>/dev/null || true
+		[[ -n ${DEV[FIRST_DOMAIN]:-} ]] || continue
+		FIRST_DOMAIN_COUNT[${DEV[FIRST_DOMAIN]}]=$((${FIRST_DOMAIN_COUNT[${DEV[FIRST_DOMAIN]}]:-0} + 1))
+	done < <(device_names)
+	((${#selected[@]} > 0)) || mapfile -t selected < <(device_names)
+
+	make_workdir
+	OUTCOME_FILE="$WORKDIR/outcome"
+	for name in "${selected[@]}"; do
+		count=$((count + 1))
+		rm -f "$OUTCOME_FILE"
+		# set -e inside the subshell ends this device at the first unexpected error. set +e around it
+		# keeps that failure from ending the whole run. Not `if (...)` or `... ||`: those would
+		# switch off set -e inside the subshell again.
+		set +e
+		(
+			set -e
+			run_device "$name"
+		)
+		rc=$?
+		set -e
+		result="FAILED: unexpected error, see the log above"
+		[[ -s $OUTCOME_FILE ]] && result=$(<"$OUTCOME_FILE")
+		((rc == 0)) || failed=$((failed + 1))
+		summary+=("  $name: $result")
+	done
+
+	log "summary: $(plural "$count" device), $failed failed"
+	((count == 0)) || printf '%s\n' "${summary[@]}"
+	[[ $failed -eq 0 ]] || exit 1
+}
+
+cmd_prune() {
+	local yes=0 file name suffix expiry
+	local -a unused=()
+	local -A used=()
+	while [[ $# -gt 0 ]]; do
+		case $1 in
+		--yes) yes=1 ;;
+		*) usage_error "prune: unknown option $1" ;;
+		esac
+		shift
+	done
+	acquire_lock
+	load_global_config || die "config has errors, run 'shelly-certs validate'"
+	validate_devices || die "device configs have errors. Fix them first, so prune can't delete a certificate a device still uses"
+	while IFS= read -r name; do
+		load_device "$name"
+		used[${DEV[FIRST_DOMAIN]}]=1
+	done < <(device_names)
+
+	for file in "$SC_CERT_DIR"/*.crt; do
+		[[ -e $file && $file != *.issuer.crt ]] || continue
+		name=${file##*/}
+		name=${name%.crt}
+		[[ -n ${used[$name]:-} ]] || unused+=("$name")
+	done
+	if ((${#unused[@]} == 0)); then
+		log "no unused certificates"
+		return
+	fi
+	for name in "${unused[@]}"; do
+		expiry=$(cert_expiry_date "$SC_CERT_DIR/$name.crt") || expiry=unknown
+		log "unused certificate: $name (expires $expiry)"
+	done
+	if [[ $yes == 0 ]]; then
+		log "$(plural "${#unused[@]}" "unused certificate"). Run 'shelly-certs prune --yes' to delete them"
+		return
+	fi
+	# Explicit suffixes, not $name.*: that would also match a longer name like $name.au.crt.
+	for name in "${unused[@]}"; do
+		for suffix in .crt .key .issuer.crt .json; do
+			rm -f "$SC_CERT_DIR/$name$suffix"
+		done
+		log "deleted $name"
+	done
+}
+
+main() {
+	local command=${1:-help}
+	[[ $# -gt 0 ]] && shift
+	case $command in
+	run) cmd_run "$@" ;;
+	prune) cmd_prune "$@" ;;
+	list) cmd_list "$@" ;;
+	deploy) cmd_deploy "$@" ;;
+	status) cmd_status "$@" ;;
+	validate) cmd_validate "$@" ;;
+	help | -h | --help) usage ;;
+	*)
+		err "unknown command: $command"
+		usage >&2
+		exit 2
+		;;
+	esac
+}
+
+main "$@"

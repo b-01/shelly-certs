@@ -1,0 +1,46 @@
+# Template: install.sh writes the real unit to systemd/generated/ with @SC_ROOT@ replaced by the
+# tool folder, and links it with systemctl link.
+[Unit]
+Description=Issue, renew and deploy Shelly certificates
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=shelly-certs
+Group=shelly-certs
+WorkingDirectory=@SC_ROOT@
+ExecStart=@SC_ROOT@/bin/shelly-certs run
+UMask=0077
+# Locked down: the service can write only to data/ and can't see /home, /root or /run/user.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=@SC_ROOT@/data
+# The service needs no root powers and no access to hardware, kernel settings or other processes.
+CapabilityBoundingSet=
+PrivateDevices=yes
+PrivateUsers=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RemoveIPC=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+# Network access stays open: lego talks to Let's Encrypt and the DNS provider, curl to the devices.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+# A blocked system call fails with EPERM, so the program can report the error. Without this line,
+# the kernel kills the process.
+SystemCallErrorNumber=EPERM
