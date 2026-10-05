@@ -82,8 +82,8 @@ test_remove_own_link_leaves_foreign_files() {
 	remove_own_link "$d/none" /target || fail "a missing link is an error"
 }
 
-# Every path .gitignore lists is something the user or install.sh created, and uninstall removes
-# exactly those. Checked against .gitignore so the two can't drift apart.
+# Every path .gitignore lists, apart from the notes for working on this repo (CLAUDE.md, .claude/),
+# is something the user or install.sh created, and uninstall removes exactly those. Checked against .gitignore so the two can't drift apart.
 test_remove_user_files_matches_gitignore() {
 	local dir entry path
 	dir=$(make_instance)
@@ -91,6 +91,7 @@ test_remove_user_files_matches_gitignore() {
 	mkdir -p "$dir/tests"
 	while IFS= read -r entry; do
 		[[ -n $entry && $entry != \#* ]] || continue
+		[[ $entry != /CLAUDE.md && $entry != /.claude/ ]] || continue
 		path="$dir${entry%/}"
 		path=${path//\*/sample}
 		mkdir -p "$(dirname "$path")"
@@ -104,6 +105,7 @@ test_remove_user_files_matches_gitignore() {
 	SC_ROOT=$dir remove_user_files
 	while IFS= read -r entry; do
 		[[ -n $entry && $entry != \#* ]] || continue
+		[[ $entry != /CLAUDE.md && $entry != /.claude/ ]] || continue
 		path="$dir${entry%/}"
 		path=${path//\*/sample}
 		[[ ! -e $path ]] || fail "$entry was not removed"
