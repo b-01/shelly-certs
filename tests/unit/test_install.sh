@@ -192,6 +192,27 @@ test_install_with_valid_config_enables_timer() {
 	assert_contains "$(cat "$dir/systemd/generated/shelly-certs.service")" "ExecStart=$dir/bin/shelly-certs run"
 }
 
+# `systemctl disable` deletes the links of a linked unit and reloads systemd, so the units must be
+# stopped first. Otherwise the running timer loses its service and fails with result 'resources'.
+test_disable_stops_units_before_disabling() {
+	local dir stubs log
+	dir=$(make_install_instance)
+	stubs="$dir/stubs"
+	log="$dir/commands.log"
+	mkdir -p "$stubs" "$dir/etc-systemd" "$dir/systemd/generated"
+	printf '#!/bin/sh\necho "systemctl $*" >>"%s"\n' "$log" >"$stubs/systemctl"
+	chmod +x "$stubs/systemctl"
+	touch "$dir/systemd/generated/shelly-certs.service" "$dir/systemd/generated/shelly-certs.timer"
+	ln -s "$dir/systemd/generated/shelly-certs.service" "$dir/etc-systemd/shelly-certs.service"
+	ln -s "$dir/systemd/generated/shelly-certs.timer" "$dir/etc-systemd/shelly-certs.timer"
+	SC_ROOT=$dir SYSTEMD_DIR=$dir/etc-systemd PATH="$stubs:$PATH" disable_install >/dev/null
+	assert_eq "systemctl stop shelly-certs.service shelly-certs.timer
+systemctl disable shelly-certs.service shelly-certs.timer
+systemctl daemon-reload" "$(cat "$log")" "systemctl calls"
+	[[ ! -e $dir/etc-systemd/shelly-certs.timer && ! -e $dir/etc-systemd/shelly-certs.service ]] ||
+		fail "the unit links were not removed"
+}
+
 test_install_takes_no_arguments() {
 	local out
 	out=$("$SC_ROOT/install.sh" /opt/shelly-certs 2>&1)

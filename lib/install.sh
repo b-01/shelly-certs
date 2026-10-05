@@ -92,8 +92,11 @@ remove_own_link() {
 disable_install() {
 	local link target
 	if [[ $(link_state "$SYSTEMD_DIR/shelly-certs.timer" "$SC_ROOT/systemd/generated/shelly-certs.timer") == ours ]]; then
-		# For a linked unit, `systemctl disable` also removes its link in /etc/systemd/system.
-		systemctl disable --now "${UNITS[@]}" || warn "systemctl disable failed, removing the links anyway"
+		# For a linked unit, `systemctl disable` also removes its link in /etc/systemd/system and
+		# reloads systemd. So stop first: `disable --now` reloads before it stops, and the running
+		# timer then fails because its service is gone.
+		systemctl stop "${UNITS[@]}" || warn "systemctl stop failed, disabling anyway"
+		systemctl disable "${UNITS[@]}" || warn "systemctl disable failed, removing the links anyway"
 	fi
 	while read -r link target; do
 		remove_own_link "$link" "$target"
