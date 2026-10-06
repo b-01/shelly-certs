@@ -139,6 +139,7 @@ make_install_instance() {
 # run_install_as_fake_root DIR runs DIR/install.sh as root inside a user namespace, so no real
 # root is needed. Stubs stand in for the commands that would change the system: they log their
 # arguments to DIR/commands.log instead. runuser runs the command as the current user.
+# SYSTEMD_DIR points at an empty folder, so a real install on this machine doesn't get in the way.
 run_install_as_fake_root() {
 	local dir=$1 stubs="$1/stubs" cmd
 	mkdir -p "$stubs"
@@ -150,7 +151,8 @@ run_install_as_fake_root() {
 	printf '#!/bin/sh\nshift 3\nexec "$@"\n' >"$stubs/runuser"
 	printf '#!/bin/sh\necho "lego version v5.5.2 linux/amd64"\n' >"$stubs/lego"
 	chmod +x "$stubs"/*
-	PATH="$stubs:$PATH" unshare -r "$dir/install.sh" 2>&1
+	mkdir -p "$dir/etc-systemd"
+	SYSTEMD_DIR=$dir/etc-systemd PATH="$stubs:$PATH" unshare -r "$dir/install.sh" 2>&1
 }
 
 # Fake root needs user namespaces. Prints a skip line and fails when they aren't available.

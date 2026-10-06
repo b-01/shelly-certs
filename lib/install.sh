@@ -4,7 +4,8 @@
 # shellcheck disable=SC2034 # used by the scripts that source this file
 SERVICE_USER=shelly-certs
 UNITS=(shelly-certs.service shelly-certs.timer)
-SYSTEMD_DIR=/etc/systemd/system
+# Tests point this at a temp folder, so they never see the links of a real install.
+SYSTEMD_DIR=${SYSTEMD_DIR:-/etc/systemd/system}
 
 require_root() {
 	[[ $EUID -eq 0 ]] || die "run this as root: sudo $0"
